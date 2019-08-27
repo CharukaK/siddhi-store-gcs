@@ -17,8 +17,11 @@
  *
  */
 
-package io.siddhi.extension.store.util;
+package io.siddhi.extension.store.gcs.util;
 
+/**
+ * Class that contains constants which are required for the GCS Connector.
+ */
 public class GCSConstants {
 
     // Common attributes that are required for the publisher and reader
@@ -29,11 +32,19 @@ public class GCSConstants {
     public static final String STORAGE_CLASS_ATTRIBUTE_NAME = "storage.class";
     public static final String SET_VERSIONING_ENABLED_ATTRIBUTE_NAME = "set.versioning.enabled";
     public static final String CONTENT_TYPE_ATTRIBUTE_NAME = "content.type";
-    public static final String OBJECT_NAME_ATTRIBUTE_NAME = "object.name";
     public static final String BUCKET_ACL_ATTRIBUTE_NAME = "bucket.acl";
-    public static final String OBJECT_ACL_ATTRIBUTE_NAME = "object.acl";
-    public static final String OBJECT_METADATA_NAME = "object.metadata";
+    public static final String OBJECT_ACL_ATTRIBUTE_NAME = "object.acl.field";
+    public static final String OBJECT_METADATA_NAME = "object.metadata.field";
+
+    public static final String DEFAULT_CONTENT_TYPE_VALUE = "siddhi-event";
 
     public static final String BOOLEAN_STRING_VALUE_FALSE = "false";
 
+    public static final String USER_TYPE_OWNER = "owner";
+    public static final String USER_TYPE_READER = "reader";
+    public static final String USER_TYPE_WRITER = "writer";
+
+    public GCSConstants() {
+        // Prevent initialization.
+    }
 }

@@ -19,7 +19,14 @@
 
 package io.siddhi.extension.store.gcs;
 
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.cloud.ReadChannel;
+import com.google.cloud.storage.Acl;
+import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.BucketInfo;
 import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageOptions;
 import io.siddhi.annotation.Example;
 import io.siddhi.annotation.Extension;
 import io.siddhi.annotation.Parameter;
@@ -28,16 +35,30 @@ import io.siddhi.core.exception.ConnectionUnavailableException;
 import io.siddhi.core.table.record.AbstractRecordTable;
 import io.siddhi.core.table.record.ExpressionBuilder;
 import io.siddhi.core.table.record.RecordIterator;
+import io.siddhi.core.util.SiddhiConstants;
 import io.siddhi.core.util.collection.operator.CompiledCondition;
 import io.siddhi.core.util.collection.operator.CompiledExpression;
 import io.siddhi.core.util.config.ConfigReader;
-import io.siddhi.core.util.transport.OptionHolder;
-import io.siddhi.extension.store.util.GCSConstants;
+import io.siddhi.extension.store.gcs.beans.GCSConfig;
+import io.siddhi.extension.store.gcs.exceptions.GCSTableException;
+import io.siddhi.extension.store.gcs.util.GCSConstants;
+import io.siddhi.query.api.annotation.Annotation;
+import io.siddhi.query.api.definition.Attribute;
 import io.siddhi.query.api.definition.TableDefinition;
+import io.siddhi.query.api.util.AnnotationHelper;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.OptionalInt;
+import org.apache.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
-import org.apache.log4j.Logger;
+import java.util.stream.IntStream;
 
 /**
  * This is a sample class-level comment, explaining what the Sink extension class does.
@@ -122,14 +143,7 @@ import org.apache.log4j.Logger;
                         type = DataType.STRING,
                         description = "Content type of the Objects which are written to the bucket",
                         optional = true,
-                        defaultValue = "wso2-event"
-                ),
-                @Parameter(
-                        name = GCSConstants.OBJECT_NAME_ATTRIBUTE_NAME,
-                        type = DataType.STRING,
-                        description = "Object name to identify the written object in the bucket",
-                        optional = true,
-                        defaultValue = "null"
+                        defaultValue = GCSConstants.DEFAULT_CONTENT_TYPE_VALUE
                 ),
                 @Parameter(
                         name = GCSConstants.BUCKET_ACL_ATTRIBUTE_NAME,
@@ -165,10 +179,13 @@ import org.apache.log4j.Logger;
 
 public class GCSEventTable extends AbstractRecordTable {
 
-//    private GCSSinkConfig gcsSinkConfig;
+    private List<Attribute> attributes;
     private Storage storage;
-//    private GCSObjectPublisher gcsObjectPublisher;
+    private GCSConfig config;
+    private Annotation primaryKeyAnnotation;
+
     private static final Logger logger = Logger.getLogger(GCSEventTable.class);
+
 
     /**
      * Initializing the Record Table
@@ -178,7 +195,13 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected void init(TableDefinition tableDefinition, ConfigReader configReader) {
+        this.attributes = tableDefinition.getAttributeList();
+        this.primaryKeyAnnotation = AnnotationHelper.getAnnotation(
+                SiddhiConstants.ANNOTATION_PRIMARY_KEY, tableDefinition.getAnnotations());
+        Annotation storeAnnotation = AnnotationHelper.getAnnotation(
+                SiddhiConstants.ANNOTATION_STORE, tableDefinition.getAnnotations());
 
+        config = new GCSConfig(storeAnnotation);
     }
 
     /**
@@ -189,7 +212,57 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected void add(List<Object[]> records) throws ConnectionUnavailableException {
+        createObject(records);
+    }
 
+    /**
+     * Create an object in the specified Google Cloud Storage bucket.
+     * @param records List of record object arrays.
+     */
+    private void createObject(List<Object[]> records) {
+        createBucketIfNotExists();
+
+        // create an object for each event received.
+        records.forEach(payload -> {
+            int primaryIndex = IntStream.range(0, attributes.size()).filter(i -> attributes.get(i).getName()
+                    .equals(primaryKeyAnnotation.getElements().get(0).getValue().trim())).findFirst().getAsInt();
+
+            OptionalInt metadataIndex = IntStream.range(0, attributes.size()).filter(i -> attributes.get(i).getName()
+                    .equals(config.getMetadataField())).findFirst();
+
+            OptionalInt objectAclIndex = IntStream.range(0, attributes.size()).filter(i -> attributes.get(i).getName()
+                    .equals(config.getObjectAclField())).findFirst();
+
+            BlobId blobId = BlobId.of(config.getBucketName(), payload[primaryIndex].toString());
+            BlobInfo.Builder blobInfoBuilder = BlobInfo.newBuilder(blobId).setContentType(config.getContentType());
+
+            if (metadataIndex.isPresent()) {
+                blobInfoBuilder.setMetadata((HashMap<String, String>) payload[metadataIndex.getAsInt()]);
+            }
+
+            if (objectAclIndex.isPresent()) {
+                blobInfoBuilder.setAcl(
+                        getObjectLevelAclList((HashMap<String, String>) payload[objectAclIndex.getAsInt()]));
+            }
+
+            StringBuilder payloadString = new StringBuilder();
+
+            for (int i = 0; i < payload.length; i++) {
+                if (i != primaryIndex && (metadataIndex.isPresent() &&
+                        metadataIndex.getAsInt() != i) && (objectAclIndex.isPresent() &&
+                        objectAclIndex.getAsInt() != i)) {
+
+                    if (payloadString.length() == 0) {
+                        payloadString.append(payload[i].toString());
+                    } else {
+                        payloadString.append(String.format(",'%s'", payload[i]));
+                    }
+
+                }
+            }
+
+            storage.create(blobInfoBuilder.build(), payloadString.toString().getBytes(StandardCharsets.UTF_8));
+        });
     }
 
     /**
@@ -203,6 +276,7 @@ public class GCSEventTable extends AbstractRecordTable {
     @Override
     protected RecordIterator<Object[]> find(Map<String, Object> findConditionParameterMap,
                                             CompiledCondition compiledCondition) throws ConnectionUnavailableException {
+        System.out.println("shshsh");
         return null;
     }
 
@@ -217,6 +291,7 @@ public class GCSEventTable extends AbstractRecordTable {
     @Override
     protected boolean contains(Map<String, Object> containsConditionParameterMap,
                                CompiledCondition compiledCondition) throws ConnectionUnavailableException {
+
         return false;
     }
 
@@ -232,7 +307,25 @@ public class GCSEventTable extends AbstractRecordTable {
     @Override
     protected void delete(List<Map<String, Object>> deleteConditionParameterMaps, CompiledCondition compiledCondition)
             throws ConnectionUnavailableException {
+        for (Map<String, Object> conditionParams : deleteConditionParameterMaps) {
+            BlobId blobId = BlobId.of(config.getBucketName(),
+                    conditionParams.get(((GCSCompiledCondition) compiledCondition)
+                            .getCompiledQuery().getStreamVariable().getName()).toString());
 
+            boolean deleted = storage.delete(blobId);
+
+            if (deleted) {
+                logger.info(String.format("Object with the name %s is deleted from the bucket %s.",
+                        conditionParams.get(((GCSCompiledCondition) compiledCondition)
+                                .getCompiledQuery().getStreamVariable().getName()).toString(),
+                                                                    config.getBucketName()));
+            } else {
+                logger.warn(String.format("Object with the name %s could not be found in the bucket %s.",
+                        conditionParams.get(((GCSCompiledCondition) compiledCondition)
+                                .getCompiledQuery().getStreamVariable().getName()).toString(),
+                                                                        config.getBucketName()));
+            }
+        }
     }
 
     /**
@@ -250,6 +343,12 @@ public class GCSEventTable extends AbstractRecordTable {
     protected void update(CompiledCondition compiledCondition, List<Map<String, Object>> list,
                           Map<String, CompiledExpression> map, List<Map<String, Object>> list1)
             throws ConnectionUnavailableException {
+        System.out.println("update");
+
+        for (Map<String, Object> keyValuePair: list) {
+
+
+        }
 
     }
 
@@ -269,7 +368,9 @@ public class GCSEventTable extends AbstractRecordTable {
     protected void updateOrAdd(CompiledCondition compiledCondition, List<Map<String, Object>> list,
                                Map<String, CompiledExpression> map, List<Map<String, Object>> list1,
                                List<Object[]> list2) throws ConnectionUnavailableException {
+        System.out.println("update Or Add");
 
+//        ReadChannel readChannel = getObjectReadChannel(config.getBucketName(), );
     }
 
     /**
@@ -281,7 +382,14 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected CompiledCondition compileCondition(ExpressionBuilder expressionBuilder) {
-        return null;
+        GCSExpressionVisitor gcsExpressionVisitor = new GCSExpressionVisitor();
+        expressionBuilder.build(gcsExpressionVisitor);
+
+        if (gcsExpressionVisitor.getCompareOperation().isValid()) {
+            return new GCSCompiledCondition(gcsExpressionVisitor.getCompareOperation());
+        } else {
+            throw new GCSTableException("Invalid BasicCompareOperation object received from the expression visitor");
+        }
     }
 
     /**
@@ -293,7 +401,7 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected CompiledExpression compileSetAttribute(ExpressionBuilder expressionBuilder) {
-        return null;
+        return compileCondition(expressionBuilder);
     }
 
     /**
@@ -305,7 +413,14 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected void connect() throws ConnectionUnavailableException {
-
+        try {
+            storage = StorageOptions.newBuilder()
+                    .setCredentials(
+                            GoogleCredentials.fromStream(new FileInputStream(
+                                    new File(config.getAuthFilePath())))).build().getService();
+        } catch (IOException e) {
+            logger.error("Error occurred while trying to connect to the Google Cloud Storage", e);
+        }
     }
 
     /**
@@ -314,7 +429,7 @@ public class GCSEventTable extends AbstractRecordTable {
      */
     @Override
     protected void disconnect() {
-
+        storage = null;
     }
 
     /**
@@ -325,4 +440,72 @@ public class GCSEventTable extends AbstractRecordTable {
     protected void destroy() {
 
     }
+
+    private void createBucketIfNotExists() {
+        // Check if the bucket exists in the GCS
+
+        if (storage != null && storage.get(config.getBucketName(), Storage.BucketGetOption.fields()) == null) {
+
+            //Create a bucket when it is not existing
+            storage.create(BucketInfo.newBuilder(config.getBucketName())
+                    .setStorageClass(config.getStorageClass())
+                    .setVersioningEnabled(config.isVersioningEnabled()).build());
+
+            // Set user defined ACLs for the bucket
+            for (Map.Entry<String, String> item : config.getBucketACLMap().entrySet()) {
+                switch (item.getValue().toLowerCase()) {
+                    case "owner":
+                        createAclForUser(item.getKey(), Acl.Role.OWNER);
+                        break;
+                    case "reader":
+                        createAclForUser(item.getKey(), Acl.Role.READER);
+                        break;
+                    case "writer":
+                        createAclForUser(item.getKey(), Acl.Role.WRITER);
+                        break;
+                    default:
+                        // not a valid type of Permission.
+                }
+            }
+
+
+        }
+    }
+
+    private Acl createAclForUser(String email, Acl.Role role) {
+        return storage.createAcl(config.getBucketName(), Acl.of(new Acl.User(email), role));
+    }
+
+    private List<Acl> getObjectLevelAclList(HashMap<String, String> aclMap) {
+        List<Acl> objectAclList = new ArrayList<>();
+
+        for (Map.Entry<String, String> entry : aclMap.entrySet()) {
+            Acl acl = null;
+
+            switch (entry.getValue().toLowerCase()) {
+                case GCSConstants.USER_TYPE_OWNER:
+                    acl = Acl.of(new Acl.User(entry.getKey()), Acl.Role.OWNER);
+                    break;
+                case GCSConstants.USER_TYPE_READER:
+                    acl = Acl.of(new Acl.User(entry.getKey()), Acl.Role.READER);
+                    break;
+                case GCSConstants.USER_TYPE_WRITER:
+                    acl = Acl.of(new Acl.User(entry.getKey()), Acl.Role.WRITER);
+                    break;
+                default:
+                    // not an valid Acl entry
+                    return Collections.emptyList();
+            }
+
+            objectAclList.add(acl);
+        }
+
+        return objectAclList;
+    }
+
+
+    private ReadChannel getObjectReadChannel(String bucketName, String objectName) {
+        return storage.get(bucketName, objectName).reader();
+    }
+
 }
